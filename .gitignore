@@ -1,0 +1,9 @@
+/chromedriver.exe
+*.log
+/.wdm
+
+venv
+*.pyc
+dist
+build
+capture
