@@ -1,3 +1,4 @@
+# main.py
 import os
 import sys
 import time
@@ -29,29 +30,33 @@ logging.getLogger("selenium").setLevel(logging.ERROR)
 SELENIUM_LOGGER.setLevel(logging.ERROR)
 
 # ----------------------------------------------------------------------
-# Логи
+# Логи (безопасная ротация по суткам)
 # ----------------------------------------------------------------------
 LOG_DIR = "."
 LOG_BASE = "capture"
 LOG_EXT = ".log"
 MAX_LOG_DAYS = 5
 
+
 def get_current_log_path():
     return os.path.join(LOG_DIR, f"{LOG_BASE}{LOG_EXT}")
+
 
 def get_dated_log_path(date_str):
     return os.path.join(LOG_DIR, f"{LOG_BASE}_{date_str}{LOG_EXT}")
 
+
 def create_new_handler():
     handler = RotatingFileHandler(
         get_current_log_path(),
-        maxBytes=5*1024*1024,
+        maxBytes=5 * 1024 * 1024,
         backupCount=1,
         delay=True,
         encoding='utf-8'
     )
     handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     return handler
+
 
 def replace_log_handler():
     root = logging.getLogger()
@@ -61,9 +66,11 @@ def replace_log_handler():
     root.addHandler(create_new_handler())
     root.setLevel(logging.INFO)
 
+
+# Инициализация
 replace_log_handler()
 logging.info("=== КОНСОЛЬНОЕ ПРИЛОЖЕНИЕ ЗАПУЩЕНО ===")
-print("Приложение запущено. Проверяем chromedriver...")
+
 
 def rotate_log_if_needed():
     current_log = get_current_log_path()
@@ -75,20 +82,27 @@ def rotate_log_if_needed():
     dated_log = get_dated_log_path(yesterday_str)
 
     if os.path.exists(dated_log):
-        return
+        return  # уже ротирован
 
     try:
         root = logging.getLogger()
         for h in root.handlers[:]:
             h.close()
             root.removeHandler(h)
+
         os.rename(current_log, dated_log)
         logging.info(f"Лог переименован: {current_log} → {dated_log}")
-        replace_log_handler()
-    except Exception as e:
-        logging.warning(f"Не удалось ротировать лог: {e}")
+
         replace_log_handler()
 
+    except Exception as e:
+        try:
+            replace_log_handler()
+        except:
+            pass
+        logging.warning(f"Не удалось ротировать лог: {e}")
+
+    # Удаляем старые логи (>5 дней)
     cutoff = datetime.now() - timedelta(days=MAX_LOG_DAYS)
     for file in Path(LOG_DIR).glob(f"{LOG_BASE}_*{LOG_EXT}"):
         try:
@@ -100,20 +114,19 @@ def rotate_log_if_needed():
         except Exception as e:
             logging.warning(f"Ошибка при удалении старого лога {file.name}: {e}")
 
+
 # ----------------------------------------------------------------------
-# Блокировка дублирующего запуска
+# Блокировка дублирующего запуска (Windows)
 # ----------------------------------------------------------------------
 if sys.platform.startswith('win'):
-    try:
-        import win32event
-        import win32api
-        from winerror import ERROR_ALREADY_EXISTS
-        mutex = win32event.CreateMutex(None, False, "Global\\CaptureApp_SingleInstance_Mutex")
-        if win32api.GetLastError() == ERROR_ALREADY_EXISTS:
-            print("Ошибка: Приложение уже запущено!")
-            sys.exit(1)
-    except ImportError:
-        print("pywin32 не установлен. Пропуск проверки дублирования.")
+    import win32event
+    import win32api
+    from winerror import ERROR_ALREADY_EXISTS
+    mutex = win32event.CreateMutex(None, False, "Global\\CaptureApp_SingleInstance_Mutex")
+    if win32api.GetLastError() == ERROR_ALREADY_EXISTS:
+        print("Приложение уже запущено!")
+        sys.exit(1)
+
 
 # ----------------------------------------------------------------------
 # Утилиты
@@ -127,16 +140,18 @@ def cleanup_processes():
         except Exception as e:
             logging.warning(f"Не удалось убить процесс: {e}")
 
+
 def is_image_black(img):
     try:
         w, h = img.size
         for x in range(0, w, 10):
             for y in range(0, h, 10):
-                if img.getpixel((x, y))[:3] != (0, 0,199):
+                if img.getpixel((x, y))[:3] != (0, 0, 0):
                     return False
         return True
     except:
         return False
+
 
 def resource_path(relative_path):
     try:
@@ -145,75 +160,35 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-# ----------------------------------------------------------------------
-# Проверка chromedriver
-# ----------------------------------------------------------------------
-def find_chromedriver():
-    possible_paths = [
-        "chromedriver.exe",
-        os.path.join("chromedriver", "chromedriver.exe"),
-        os.path.join(sys._MEIPASS, "chromedriver.exe") if getattr(sys, 'frozen', False) else None,
-    ]
-    for path in possible_paths:
-        if path and os.path.isfile(path):
-            return path
-    return None
-
-chromedriver_path = find_chromedriver()
-if not chromedriver_path:
-    error_msg = "ОШИБКА: chromedriver.exe НЕ НАЙДЕН!\n" \
-                "Поместите chromedriver.exe в папку со скриптом или в подпапку 'chromedriver/'.\n" \
-                "Скачать: https://chromedriver.chromium.org/downloads (версия под ваш Chrome!)"
-    logging.critical(error_msg)
-    print(error_msg)
-    sys.exit(1)
-else:
-    logging.info(f"chromedriver найден: {chromedriver_path}")
-    print(f"chromedriver найден: {chromedriver_path}")
 
 # ----------------------------------------------------------------------
-# Проверка заглушек
-# ----------------------------------------------------------------------
-nocam_path = resource_path(os.path.join("resource", "nocam.png"))
-noconnect_path = resource_path(os.path.join("resource", "noconnect.png"))
-
-if not os.path.exists(nocam_path):
-    logging.warning("resource/nocam.png не найден — будет пропущен")
-if not os.path.exists(noconnect_path):
-    logging.warning("resource/noconnect.png не найден — будет пропущен")
-
-# ----------------------------------------------------------------------
-# Конфиг
+# Конфиг (url.yaml)
 # ----------------------------------------------------------------------
 class ConfigManager:
-    DEFAULT_URLS = [None] * 9
+    DEFAULT_URLS = [None] * 9  # 9 камер, по умолчанию None
 
     def __init__(self, filename='url.yaml'):
         self.filename = filename
         self.yaml = YAML()
+        self.yaml.preserve_quotes = False
         self.urls = self.DEFAULT_URLS.copy()
         self._load()
 
     def _load(self):
         if not os.path.exists(self.filename):
             logging.warning(f"Файл {self.filename} не найден, используются пустые URL")
-            print(f"ВНИМАНИЕ: {self.filename} не найден!")
             return
 
         try:
             with open(self.filename, 'r', encoding='utf-8') as f:
                 loaded = self.yaml.load(f) or {}
             if 'urls' in loaded and isinstance(loaded['urls'], list):
-                urls = loaded['urls']
-                self.urls = (urls + [None] * 9)[:9]
-                logging.info(f"Загружено {len([u for u in self.urls if u])} камер из {self.filename}")
-                print(f"Загружено {len([u for u in self.urls if u])} камер")
+                self.urls = loaded['urls'][:9] + [None] * (9 - len(loaded['urls']))
             else:
-                logging.warning("Неверный формат url.yaml")
-                print("ОШИБКА: Неверный формат url.yaml")
+                logging.warning("Неверный формат url.yaml, ожидается ключ 'urls' со списком")
         except Exception as e:
             logging.error(f"Ошибка загрузки url.yaml: {e}")
-            print(f"Ошибка загрузки url.yaml: {e}")
+
 
 # ----------------------------------------------------------------------
 # Драйвер
@@ -224,78 +199,64 @@ class BrowserDriver:
         self.cam_index = cam_index
         self.driver = None
         self.iframe_element = None
-        self._init_driver()
-
-    def _init_driver(self):
-        if not self.url:
-            return
-
-        try:
-            chrome_options = Options()
-            chrome_options.add_argument("--headless")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--window-size=1920,1080")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--disable-extensions")
-            chrome_options.add_argument("--disable-infobars")
-            chrome_options.add_argument("--disable-notifications")
-            chrome_options.add_experimental_option("useAutomationExtension", False)
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-
-            service = Service(executable_path=chromedriver_path)
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            logging.info(f"Драйвер запущен для cam{self.cam_index}")
+        if self.url:
+            self._setup_driver()
             self._init_page()
-        except Exception as e:
-            logging.error(f"Не удалось запустить драйвер для cam{self.cam_index}: {e}")
-            self.driver = None
+
+    def _setup_driver(self):
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chromedriver_path = os.path.join(sys._MEIPASS, "chromedriver.exe") if getattr(sys, 'frozen', False) else "chromedriver.exe"
+        service = Service(executable_path=chromedriver_path)
+        self.driver = webdriver.Chrome(service=service, options=chrome_options)
 
     def _init_page(self):
         try:
             self.driver.get(self.url)
-            WebDriverWait(self.driver, 25).until(EC.presence_of_element_located((By.ID, "ModalBodyPlayer")))
-            self.iframe_element = WebDriverWait(self.driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "iframe")))
-            logging.info(f"Страница загружена для cam{self.cam_index}")
+            WebDriverWait(self.driver, 20).until(EC.presence_of_element_located((By.ID, "ModalBodyPlayer")))
+            self.iframe_element = WebDriverWait(self.driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "iframe")))
         except Exception as e:
             logging.error(f"Не загрузилась страница для cam{self.cam_index}: {e}")
             self.driver = None
 
     def reload_via_url(self):
-        if not self.driver:
-            self._init_driver()
-            return False
         try:
             logging.info(f"Перезагрузка страницы для cam{self.cam_index}")
             self.driver.get(self.url)
             self.driver.refresh()
-            time.sleep(2)
-            WebDriverWait(self.driver, 30).until(EC.presence_of_element_located((By.ID, "ModalBodyPlayer")))
-            self.iframe_element = WebDriverWait(self.driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "iframe")))
+            time.sleep(1)
+            WebDriverWait(self.driver, 25).until(EC.presence_of_element_located((By.ID, "ModalBodyPlayer")))
+            self.iframe_element = WebDriverWait(self.driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "iframe")))
+            if not self.iframe_element.get_attribute("src") or "about:blank" in self.iframe_element.get_attribute("src"):
+                logging.warning(f"iframe src пустой для cam{self.cam_index}")
+                return False
             return True
         except Exception as e:
             logging.error(f"Ошибка перезагрузки для cam{self.cam_index}: {e}")
-            self.restart()
             return False
 
     def restart(self):
-        if self.driver:
-            try: self.driver.quit()
-            except: pass
-        time.sleep(3)
-        self._init_driver()
+        try:
+            self.driver.quit()
+        except:
+            pass
+        time.sleep(2)
+        self._setup_driver()
+        self._init_page()
+        logging.info(f"Драйвер перезапущен для cam{self.cam_index}")
 
     def get_iframe_size(self):
-        if not self.driver or not self.iframe_element:
-            return None
         try:
             return self.driver.execute_script("return arguments[0].getBoundingClientRect()", self.iframe_element)
-        except:
+        except Exception as e:
+            logging.warning(f"Ошибка get_iframe_size для cam{self.cam_index}: {e}")
             return None
 
     def capture_frame(self, file_path):
-        if not self.driver:
-            return False
         try:
             self.driver.switch_to.frame(self.iframe_element)
             try:
@@ -318,99 +279,124 @@ class BrowserDriver:
             except:
                 pass
 
+
 # ----------------------------------------------------------------------
-# Захват
+# Захват кадров — ТОЛЬКО ОДИН ФАЙЛ В ПАПКЕ (с .png расширением)
 # ----------------------------------------------------------------------
 class FrameCapture:
+    CURRENT_FILE = "current.png"  # Всегда .png
+    TEMP_FILE = "temp_capture.png"  # Временный файл с .png
+
     def __init__(self, driver, cam_index):
         self.driver = driver
         self.cam_index = cam_index
         self.folder = os.path.join("capture", f"cam{cam_index}")
         os.makedirs(self.folder, exist_ok=True)
+        self.current_path = os.path.join(self.folder, self.CURRENT_FILE)
+        self.temp_path = os.path.join(self.folder, self.TEMP_FILE)
 
     def capture(self):
-        now = datetime.now()
-        date_str = now.strftime("%Y%m%d")
-        time_str = now.strftime("%H-%M-%S")
-        filename = f"capt-{date_str}_{time_str}.png"
-        file_path = os.path.join(self.folder, filename)
-
-        # Нет URL — заглушка
         if not self.driver.url:
-            if os.path.exists(nocam_path):
-                shutil.copy(nocam_path, file_path)
-                logging.info(f"nocam.png → cam{self.cam_index}")
+            src = resource_path(os.path.join("resource", "nocam.png"))
+            if os.path.exists(src):
+                shutil.copy(src, self.current_path)
+                logging.info(f"Сохранена заглушка nocam.png → cam{self.cam_index}")
+            else:
+                logging.warning(f"nocam.png не найден для cam{self.cam_index}")
             return True
 
-        # Пытаемся захватить
         try:
-            if not self.driver.driver:
-                self.driver.restart()
-
             size = self.driver.get_iframe_size()
             if not size or size['width'] < 1 or size['height'] < 1:
-                self.driver.reload_via_url()
-                return self._save_noconnect(file_path)
+                logging.warning(f"iframe размер некорректный для cam{self.cam_index} → перезагрузка")
+                if self.driver.reload_via_url():
+                    time.sleep(1)
+                return self._save_noconnect()
 
-            if not self.driver.capture_frame(file_path):
-                self.driver.reload_via_url()
-                return self._save_noconnect(file_path)
+            # Используем .png явно
+            if not self.driver.capture_frame(self.temp_path):
+                logging.warning(f"capture_frame не удался для cam{self.cam_index} → перезагрузка")
+                if self.driver.reload_via_url():
+                    time.sleep(1)
+                return self._save_noconnect()
 
-            if is_image_black(Image.open(file_path)):
-                os.remove(file_path)
-                self.driver.reload_via_url()
-                return self._save_noconnect(file_path)
+            if is_image_black(Image.open(self.temp_path)):
+                self._safe_remove(self.temp_path)
+                logging.warning(f"Чёрный кадр для cam{self.cam_index} → перезагрузка")
+                if self.driver.reload_via_url():
+                    time.sleep(1)
+                return self._save_noconnect()
 
-            with Image.open(file_path) as img:
+            with Image.open(self.temp_path) as img:
                 w, h = img.size
                 if w < 132:
-                    os.remove(file_path)
-                    self.driver.reload_via_url()
-                    return self._save_noconnect(file_path)
-                img.crop((66, 0, w-66, h)).save(file_path, quality=95)
+                    self._safe_remove(self.temp_path)
+                    logging.warning(f"Узкий кадр (w={w}) для cam{self.cam_index} → перезагрузка")
+                    if self.driver.reload_via_url():
+                        time.sleep(1)
+                    return self._save_noconnect()
+                img.crop((66, 0, w - 66, h)).save(self.temp_path, format='PNG', quality=95)
 
-            if os.path.getsize(file_path) / 1024 < 100:
-                os.remove(file_path)
-                self.driver.reload_via_url()
-                return self._save_noconnect(file_path)
+            if os.path.getsize(self.temp_path) / 1024 < 100:
+                self._safe_remove(self.temp_path)
+                logging.warning(f"Обманка (<100 КБ) для cam{self.cam_index} → перезагрузка")
+                if self.driver.reload_via_url():
+                    time.sleep(1)
+                return self._save_noconnect()
 
-            logging.info(f"Успешно сохранено: cam{self.cam_index} → {filename}")
-            self._limit_frames()
+            # Успешно → атомарно заменяем current.png
+            if os.path.exists(self.current_path):
+                os.replace(self.temp_path, self.current_path)
+            else:
+                os.rename(self.temp_path, self.current_path)
+            logging.info(f"Обновлён кадр cam{self.temp_path}: current.png")
             return True
 
         except Exception as e:
-            try: os.remove(file_path)
-            except: pass
+            self._safe_remove(self.temp_path)
             logging.error(f"Исключение при захвате cam{self.cam_index}: {e}")
-            self.driver.restart()
-            return self._save_noconnect(file_path)
+            if self.driver.reload_via_url():
+                time.sleep(1)
+            return self._save_noconnect()
 
-    def _save_noconnect(self, file_path):
-        if os.path.exists(noconnect_path):
-            shutil.copy(noconnect_path, file_path)
-            logging.info(f"noconnect.png → cam{self.cam_index}")
-            self._limit_frames()
+    def _save_noconnect(self):
+        src = resource_path(os.path.join("resource", "noconnect.png"))
+        if os.path.exists(src):
+            shutil.copy(src, self.current_path)
+            logging.info(f"Сохранена заглушка noconnect.png → cam{self.cam_index}")
             return True
-        return False
+        else:
+            logging.warning(f"noconnect.png не найден для cam{self.cam_index}")
+            return False
 
-    def _limit_frames(self):
-        frames = sorted(Path(self.folder).glob("capt-*.png"), key=lambda x: x.stat().st_mtime, reverse=True)
-        for old in frames[10:]:
-            try:
-                old.unlink()
-                logging.info(f"Удалён старый кадр: {old.name}")
-            except:
-                pass
+    def _safe_remove(self, path):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except:
+            pass
+
 
 # ----------------------------------------------------------------------
-# Поток захвата
+# Поток захвата для каждой камеры
 # ----------------------------------------------------------------------
 def capture_thread(cam_index, url):
     driver = BrowserDriver(url, cam_index)
     capture = FrameCapture(driver, cam_index)
     while True:
         capture.capture()
-        time.sleep(1)
+        time.sleep(1)  # 1 кадр в секунду
+
+
+# ----------------------------------------------------------------------
+# Импорт и запуск веб-сервера
+# ----------------------------------------------------------------------
+try:
+    from web_server import start_web_server
+except ImportError:
+    logging.error("Не найден web_server.py — веб-интерфейс отключён")
+    start_web_server = lambda: None
+
 
 # ----------------------------------------------------------------------
 # Запуск
@@ -419,17 +405,22 @@ if __name__ == "__main__":
     cleanup_processes()
     config = ConfigManager()
 
-    print("Запуск 9 потоков захвата...")
-    threads = []
+    # Запуск потоков захвата
+    capture_threads = []
     for i in range(9):
-        url = config.urls[i]
-        t = threading.Thread(target=capture_thread, args=(i+1, url), daemon=True)
+        url = config.urls[i] if i < len(config.urls) else None
+        t = threading.Thread(target=capture_thread, args=(i + 1, url), daemon=True)
         t.start()
-        threads.append(t)
-        print(f"  → cam{i+1}: {'[URL]' if url else '[NO CAM]'}")
+        capture_threads.append(t)
 
+    # Запуск веб-сервера
+    web_thread = start_web_server()
+
+    # Ротация логов
     last_log_date = datetime.now().strftime("%Y%m%d")
     try:
+        print("\nПриложение запущено. Захват кадров: 1 раз/сек. Веб-сервер: http://localhost:5000")
+        print("Для остановки нажмите Ctrl+C\n")
         while True:
             now = datetime.now()
             today_str = now.strftime("%Y%m%d")
@@ -438,6 +429,5 @@ if __name__ == "__main__":
                 last_log_date = today_str
             time.sleep(60)
     except KeyboardInterrupt:
-        print("\nОстановка...")
+        print("\nОстановка приложения...")
         cleanup_processes()
-        sys.exit(0)
