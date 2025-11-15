@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import threading
 import shutil
+import socket
 
 from ruamel.yaml import YAML
 
@@ -82,7 +83,7 @@ def rotate_log_if_needed():
     dated_log = get_dated_log_path(yesterday_str)
 
     if os.path.exists(dated_log):
-        return  # уже ротирован
+        return
 
     try:
         root = logging.getLogger()
@@ -92,9 +93,7 @@ def rotate_log_if_needed():
 
         os.rename(current_log, dated_log)
         logging.info(f"Лог переименован: {current_log} → {dated_log}")
-
         replace_log_handler()
-
     except Exception as e:
         try:
             replace_log_handler()
@@ -102,7 +101,6 @@ def rotate_log_if_needed():
             pass
         logging.warning(f"Не удалось ротировать лог: {e}")
 
-    # Удаляем старые логи (>5 дней)
     cutoff = datetime.now() - timedelta(days=MAX_LOG_DAYS)
     for file in Path(LOG_DIR).glob(f"{LOG_BASE}_*{LOG_EXT}"):
         try:
@@ -116,15 +114,23 @@ def rotate_log_if_needed():
 
 
 # ----------------------------------------------------------------------
-# Блокировка дублирующего запуска (Windows)
+# Проверка доступности порта 5000
 # ----------------------------------------------------------------------
-if sys.platform.startswith('win'):
-    import win32event
-    import win32api
-    from winerror import ERROR_ALREADY_EXISTS
-    mutex = win32event.CreateMutex(None, False, "Global\\CaptureApp_SingleInstance_Mutex")
-    if win32api.GetLastError() == ERROR_ALREADY_EXISTS:
-        print("Приложение уже запущено!")
+def check_port_free(port=5000, host="127.0.0.1"):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        try:
+            s.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def exit_if_port_busy():
+    if not check_port_free(5000):
+        print("Ошибка: порт 5000 уже занят другим процессом.")
+        print("Освободите порт или измените его в web_server.py.")
+        logging.critical("Порт 5000 занят — приложение завершено.")
         sys.exit(1)
 
 
@@ -165,7 +171,7 @@ def resource_path(relative_path):
 # Конфиг (url.yaml)
 # ----------------------------------------------------------------------
 class ConfigManager:
-    DEFAULT_URLS = [None] * 9  # 9 камер, по умолчанию None
+    DEFAULT_URLS = [None] * 9
 
     def __init__(self, filename='url.yaml'):
         self.filename = filename
@@ -281,11 +287,11 @@ class BrowserDriver:
 
 
 # ----------------------------------------------------------------------
-# Захват кадров — ТОЛЬКО ОДИН ФАЙЛ В ПАПКЕ (с .png расширением)
+# Захват кадров — ТОЛЬКО ОДИН ФАЙЛ current.png
 # ----------------------------------------------------------------------
 class FrameCapture:
-    CURRENT_FILE = "current.png"  # Всегда .png
-    TEMP_FILE = "temp_capture.png"  # Временный файл с .png
+    CURRENT_FILE = "current.png"
+    TEMP_FILE = "temp_capture.png"
 
     def __init__(self, driver, cam_index):
         self.driver = driver
@@ -313,7 +319,6 @@ class FrameCapture:
                     time.sleep(1)
                 return self._save_noconnect()
 
-            # Используем .png явно
             if not self.driver.capture_frame(self.temp_path):
                 logging.warning(f"capture_frame не удался для cam{self.cam_index} → перезагрузка")
                 if self.driver.reload_via_url():
@@ -344,12 +349,11 @@ class FrameCapture:
                     time.sleep(1)
                 return self._save_noconnect()
 
-            # Успешно → атомарно заменяем current.png
             if os.path.exists(self.current_path):
                 os.replace(self.temp_path, self.current_path)
             else:
                 os.rename(self.temp_path, self.current_path)
-            logging.info(f"Обновлён кадр cam{self.temp_path}: current.png")
+            logging.info(f"Обновлён кадр cam{self.cam_index}: current.png")
             return True
 
         except Exception as e:
@@ -378,18 +382,18 @@ class FrameCapture:
 
 
 # ----------------------------------------------------------------------
-# Поток захвата для каждой камеры
+# Поток захвата
 # ----------------------------------------------------------------------
 def capture_thread(cam_index, url):
     driver = BrowserDriver(url, cam_index)
     capture = FrameCapture(driver, cam_index)
     while True:
         capture.capture()
-        time.sleep(1)  # 1 кадр в секунду
+        time.sleep(1)
 
 
 # ----------------------------------------------------------------------
-# Импорт и запуск веб-сервера
+# Импорт веб-сервера
 # ----------------------------------------------------------------------
 try:
     from web_server import start_web_server
@@ -403,6 +407,10 @@ except ImportError:
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     cleanup_processes()
+
+    # Проверка порта ДО запуска сервера
+    exit_if_port_busy()
+
     config = ConfigManager()
 
     # Запуск потоков захвата
@@ -419,7 +427,10 @@ if __name__ == "__main__":
     # Ротация логов
     last_log_date = datetime.now().strftime("%Y%m%d")
     try:
-        print("\nПриложение запущено. Захват кадров: 1 раз/сек. Веб-сервер: http://localhost:5000")
+        print("\nПриложение запущено.")
+        print("Захват кадров: 1 раз/сек")
+        print("Веб-сервер: http://localhost:5000")
+        print("VLC-потоки: http://localhost:5000/stream/cam1 ... /stream/cam9")
         print("Для остановки нажмите Ctrl+C\n")
         while True:
             now = datetime.now()

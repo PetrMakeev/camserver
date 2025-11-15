@@ -1,149 +1,116 @@
-# web_server.py
+# web_server.py (обновлённая версия)
+
 import os
 import threading
 import time
 from flask import Flask, Response, render_template_string
 from pathlib import Path
+from PIL import Image
+import io
+from main import resource_path
 
-# ----------------------------------------------------------------------
-# Конфигурация
-# ----------------------------------------------------------------------
+# --- Конфигурация ---
 CAPTURE_ROOT = "capture"
-REFRESH_INTERVAL = 1.0  # секунд между обновлениями
+REFRESH_INTERVAL = 0.5
+JPEG_QUALITY = 80
 HOST = "0.0.0.0"
 PORT = 5000
 DEBUG = False
 
-# ----------------------------------------------------------------------
-# Flask приложение
-# ----------------------------------------------------------------------
 app = Flask(__name__)
 
-# HTML шаблон для страницы камеры
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Камера {{ cam_id }}</title>
-    <style>
-        body, html { margin:0; padding:0; height:100%; background:#000; overflow:hidden; }
-        img { width:100%; height:100%; object-fit: contain; }
-    </style>
-</head>
-<body>
-    <img src="{{ url_for('video_feed', cam_id=cam_id) }}" alt="Камера {{ cam_id }}">
-</body>
-</html>
-"""
-
-# Главная страница — список камер
-INDEX_HTML = """
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Мониторинг камер</title>
-    <style>
-        body { font-family: Arial, sans-serif; background:#111; color:#eee; padding:20px; }
-        h1 { text-align:center; }
-        .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap:15px; }
-        .cam { background:#222; padding:10px; border-radius:8px; text-align:center; }
-        .cam a { color:#0af; text-decoration:none; font-size:1.2em; }
-        .cam a:hover { text-decoration:underline; }
-    </style>
-</head>
-<body>
-    <h1>Живые камеры (9 шт)</h1>
-    <div class="grid">
-        {% for i in range(1, 10) %}
-        <div class="cam">
-            <a href="/cam{{ i }}">Камера {{ i }}</a>
-        </div>
-        {% endfor %}
-    </div>
-</body>
-</html>
-"""
-
-def get_latest_frame(cam_folder):
-    frame_path = os.path.join(cam_folder, "current.png")
-    return frame_path if os.path.exists(frame_path) else None
-
-def generate_frames(cam_id):
-    """Генератор MJPEG потока для одной камеры"""
-    cam_folder = os.path.join(CAPTURE_ROOT, f"cam{cam_id}")
-    last_mtime = 0
-
-    while True:
-        frame_path = get_latest_frame(cam_folder)
-        placeholder = None
-
-        # Если нет кадров — используем заглушку
-        if not frame_path:
-            placeholder = os.path.join("resource", "nocam.png")
-            if not os.path.exists(placeholder):
-                placeholder = os.path.join("resource", "noconnect.png")
-        else:
-            current_mtime = os.path.getmtime(frame_path)
-            if current_mtime <= last_mtime:
-                time.sleep(0.1)
-                continue
-            last_mtime = current_mtime
-
-        # Читаем изображение
-        try:
-            with open(frame_path or placeholder, "rb") as f:
-                frame_data = f.read()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/png\r\n\r\n' + frame_data + b'\r\n')
-        except Exception as e:
-            print(f"[WEB] Ошибка чтения кадра cam{cam_id}: {e}")
-
-        time.sleep(REFRESH_INTERVAL)
+# --- Главная страница ---
+INDEX_HTML = """... (см. выше) ..."""
 
 @app.route('/')
 def index():
     return render_template_string(INDEX_HTML)
 
+# --- Чтение current.png ---
+def get_current_frame_path(cam_id):
+    folder = os.path.join(CAPTURE_ROOT, f"cam{cam_id}")
+    path = os.path.join(folder, "current.png")
+    return path if os.path.exists(path) else None
+
+# --- Конвертация в JPEG ---
+def load_and_convert_to_jpeg(image_path):
+    try:
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+            return buf.getvalue()
+    except Exception as e:
+        print(f"[JPEG] Ошибка: {e}")
+        return None
+
+# --- MJPEG генератор ---
+def generate_mjpeg(cam_id):
+    last_mtime = 0
+    placeholder_nocam = resource_path(os.path.join("resource", "nocam.png"))
+    placeholder_noconnect = resource_path(os.path.join("resource", "noconnect.png"))
+
+    while True:
+        frame_path = get_current_frame_path(cam_id)
+        use_placeholder = None
+        jpeg_data = None
+
+        if not frame_path:
+            use_placeholder = placeholder_nocam if os.path.exists(placeholder_nocam) else placeholder_noconnect
+        else:
+            mtime = os.path.getmtime(frame_path)
+            if mtime <= last_mtime:
+                time.sleep(REFRESH_INTERVAL)
+                continue
+            last_mtime = mtime
+
+        if use_placeholder or frame_path:
+            jpeg_data = load_and_convert_to_jpeg(use_placeholder or frame_path)
+
+        if jpeg_data:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n'
+                   b'Content-Length: ' + str(len(jpeg_data)).encode() + b'\r\n\r\n' +
+                   jpeg_data + b'\r\n')
+        else:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n'
+                   b'Content-Length: 0\r\n\r\n')
+
+        time.sleep(REFRESH_INTERVAL)
+
+# --- ЕДИНСТВЕННЫЙ ПОТОК ДЛЯ КАМЕРЫ ---
 @app.route('/cam<int:cam_id>')
-def cam_page(cam_id):
+def cam_stream(cam_id):
     if cam_id < 1 or cam_id > 9:
         return "Камера не найдена", 404
-    return render_template_string(HTML_TEMPLATE, cam_id=cam_id)
+    return Response(
+        generate_mjpeg(cam_id),
+        mimetype='multipart/x-mixed-replace; boundary=frame',
+        headers={
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+            'Connection': 'close',
+            'Content-Disposition': f'inline; filename="cam{cam_id}.mjpg"'
+        }
+    )
 
-@app.route('/video_feed/<int:cam_id>')
-def video_feed(cam_id):
-    if cam_id < 1 or cam_id > 9:
-        return "Камера не найдена", 404
-    return Response(generate_frames(cam_id),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-# ----------------------------------------------------------------------
-# Запуск сервера в отдельном потоке
-# ----------------------------------------------------------------------
+# --- Запуск ---
 def run_server():
-    """Запуск Flask-сервера в фоновом потоке"""
-    print(f"[WEB] Веб-сервер запущен: http://localhost:{PORT}")
-    print(f"[WEB] Доступны страницы: /cam1 ... /cam9")
+    print(f"[WEB] Сервер: http://localhost:{PORT}")
+    print(f"[WEB] VLC: /cam1 ... /cam9")
     app.run(host=HOST, port=PORT, debug=DEBUG, threaded=True, use_reloader=False)
 
 def start_web_server():
-    """Запуск сервера в отдельном потоке"""
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
+    time.sleep(1)
     return thread
 
-# ----------------------------------------------------------------------
-# Автозапуск при импорте (опционально)
-# ----------------------------------------------------------------------
 if __name__ == "__main__":
     start_web_server()
-    # Бесконечный цикл, чтобы процесс не завершился
     try:
-        while True:
-            time.sleep(1)
+        while True: time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[WEB] Сервер остановлен.")
+        print("\n[WEB] Остановлено.")
