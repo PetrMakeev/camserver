@@ -4,12 +4,13 @@ import sys
 import time
 import psutil
 import logging
+import requests
+import shutil
+import socket
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import threading
-import shutil
-import socket
 
 from ruamel.yaml import YAML
 
@@ -31,21 +32,23 @@ logging.getLogger("selenium").setLevel(logging.ERROR)
 SELENIUM_LOGGER.setLevel(logging.ERROR)
 
 # ----------------------------------------------------------------------
-# Логи (безопасная ротация по суткам)
+# === КОНФИГУРАЦИЯ ===
+# ----------------------------------------------------------------------
+CAPTURE_INTERVAL = 1  # Интервал захвата кадров (секунды)
+
+# ----------------------------------------------------------------------
+# Логи (ротация по суткам)
 # ----------------------------------------------------------------------
 LOG_DIR = "."
 LOG_BASE = "capture"
 LOG_EXT = ".log"
 MAX_LOG_DAYS = 5
 
-
 def get_current_log_path():
     return os.path.join(LOG_DIR, f"{LOG_BASE}{LOG_EXT}")
 
-
 def get_dated_log_path(date_str):
     return os.path.join(LOG_DIR, f"{LOG_BASE}_{date_str}{LOG_EXT}")
-
 
 def create_new_handler():
     handler = RotatingFileHandler(
@@ -58,7 +61,6 @@ def create_new_handler():
     handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     return handler
 
-
 def replace_log_handler():
     root = logging.getLogger()
     for h in list(root.handlers):
@@ -67,11 +69,8 @@ def replace_log_handler():
     root.addHandler(create_new_handler())
     root.setLevel(logging.INFO)
 
-
-# Инициализация
 replace_log_handler()
 logging.info("=== КОНСОЛЬНОЕ ПРИЛОЖЕНИЕ ЗАПУЩЕНО ===")
-
 
 def rotate_log_if_needed():
     current_log = get_current_log_path()
@@ -81,7 +80,6 @@ def rotate_log_if_needed():
     yesterday = datetime.now() - timedelta(days=1)
     yesterday_str = yesterday.strftime("%Y%m%d")
     dated_log = get_dated_log_path(yesterday_str)
-
     if os.path.exists(dated_log):
         return
 
@@ -90,7 +88,6 @@ def rotate_log_if_needed():
         for h in root.handlers[:]:
             h.close()
             root.removeHandler(h)
-
         os.rename(current_log, dated_log)
         logging.info(f"Лог переименован: {current_log} → {dated_log}")
         replace_log_handler()
@@ -112,9 +109,8 @@ def rotate_log_if_needed():
         except Exception as e:
             logging.warning(f"Ошибка при удалении старого лога {file.name}: {e}")
 
-
 # ----------------------------------------------------------------------
-# Проверка доступности порта 5000
+# Проверка порта 5000
 # ----------------------------------------------------------------------
 def check_port_free(port=5000, host="127.0.0.1"):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -125,14 +121,12 @@ def check_port_free(port=5000, host="127.0.0.1"):
         except OSError:
             return False
 
-
 def exit_if_port_busy():
     if not check_port_free(5000):
-        print("Ошибка: порт 5000 уже занят другим процессом.")
-        print("Освободите порт или измените его в web_server.py.")
+        print("Ошибка: порт 5000 уже занят.")
+        print("Освободите порт или измените PORT в web_server.py")
         logging.critical("Порт 5000 занят — приложение завершено.")
         sys.exit(1)
-
 
 # ----------------------------------------------------------------------
 # Утилиты
@@ -146,7 +140,6 @@ def cleanup_processes():
         except Exception as e:
             logging.warning(f"Не удалось убить процесс: {e}")
 
-
 def is_image_black(img):
     try:
         w, h = img.size
@@ -158,7 +151,6 @@ def is_image_black(img):
     except:
         return False
 
-
 def resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
@@ -166,13 +158,11 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-
 # ----------------------------------------------------------------------
-# Конфиг (url.yaml)
+# Конфиг
 # ----------------------------------------------------------------------
 class ConfigManager:
     DEFAULT_URLS = [None] * 9
-
     def __init__(self, filename='url.yaml'):
         self.filename = filename
         self.yaml = YAML()
@@ -182,19 +172,15 @@ class ConfigManager:
 
     def _load(self):
         if not os.path.exists(self.filename):
-            logging.warning(f"Файл {self.filename} не найден, используются пустые URL")
+            logging.warning(f"Файл {self.filename} не найден")
             return
-
         try:
             with open(self.filename, 'r', encoding='utf-8') as f:
                 loaded = self.yaml.load(f) or {}
             if 'urls' in loaded and isinstance(loaded['urls'], list):
                 self.urls = loaded['urls'][:9] + [None] * (9 - len(loaded['urls']))
-            else:
-                logging.warning("Неверный формат url.yaml, ожидается ключ 'urls' со списком")
         except Exception as e:
             logging.error(f"Ошибка загрузки url.yaml: {e}")
-
 
 # ----------------------------------------------------------------------
 # Драйвер
@@ -231,35 +217,22 @@ class BrowserDriver:
 
     def reload_via_url(self):
         try:
-            logging.info(f"Перезагрузка страницы для cam{self.cam_index}")
+            logging.info(f"Перезагрузка cam{self.cam_index}")
             self.driver.get(self.url)
             self.driver.refresh()
             time.sleep(1)
             WebDriverWait(self.driver, 25).until(EC.presence_of_element_located((By.ID, "ModalBodyPlayer")))
             self.iframe_element = WebDriverWait(self.driver, 25).until(EC.presence_of_element_located((By.TAG_NAME, "iframe")))
-            if not self.iframe_element.get_attribute("src") or "about:blank" in self.iframe_element.get_attribute("src"):
-                logging.warning(f"iframe src пустой для cam{self.cam_index}")
-                return False
-            return True
+            return "about:blank" not in self.iframe_element.get_attribute("src")
         except Exception as e:
-            logging.error(f"Ошибка перезагрузки для cam{self.cam_index}: {e}")
+            logging.error(f"Ошибка перезагрузки cam{self.cam_index}: {e}")
             return False
-
-    def restart(self):
-        try:
-            self.driver.quit()
-        except:
-            pass
-        time.sleep(2)
-        self._setup_driver()
-        self._init_page()
-        logging.info(f"Драйвер перезапущен для cam{self.cam_index}")
 
     def get_iframe_size(self):
         try:
             return self.driver.execute_script("return arguments[0].getBoundingClientRect()", self.iframe_element)
         except Exception as e:
-            logging.warning(f"Ошибка get_iframe_size для cam{self.cam_index}: {e}")
+            logging.warning(f"get_iframe_size error cam{self.cam_index}: {e}")
             return None
 
     def capture_frame(self, file_path):
@@ -275,7 +248,7 @@ class BrowserDriver:
                 self.driver.switch_to.default_content()
             return True
         except Exception as e:
-            logging.warning(f"Ошибка захвата кадра для cam{self.cam_index}: {e}")
+            logging.warning(f"capture_frame error cam{self.cam_index}: {e}")
             return False
 
     def quit(self):
@@ -285,9 +258,8 @@ class BrowserDriver:
             except:
                 pass
 
-
 # ----------------------------------------------------------------------
-# Захват кадров — ТОЛЬКО ОДИН ФАЙЛ current.png
+# Захват
 # ----------------------------------------------------------------------
 class FrameCapture:
     CURRENT_FILE = "current.png"
@@ -306,28 +278,23 @@ class FrameCapture:
             src = resource_path(os.path.join("resource", "nocam.png"))
             if os.path.exists(src):
                 shutil.copy(src, self.current_path)
-                logging.info(f"Сохранена заглушка nocam.png → cam{self.cam_index}")
-            else:
-                logging.warning(f"nocam.png не найден для cam{self.cam_index}")
+                logging.info(f"nocam.png → cam{self.cam_index}")
             return True
 
         try:
             size = self.driver.get_iframe_size()
-            if not size or size['width'] < 1 or size['height'] < 1:
-                logging.warning(f"iframe размер некорректный для cam{self.cam_index} → перезагрузка")
+            if not size or size['width'] < 1:
                 if self.driver.reload_via_url():
                     time.sleep(1)
                 return self._save_noconnect()
 
             if not self.driver.capture_frame(self.temp_path):
-                logging.warning(f"capture_frame не удался для cam{self.cam_index} → перезагрузка")
                 if self.driver.reload_via_url():
                     time.sleep(1)
                 return self._save_noconnect()
 
             if is_image_black(Image.open(self.temp_path)):
                 self._safe_remove(self.temp_path)
-                logging.warning(f"Чёрный кадр для cam{self.cam_index} → перезагрузка")
                 if self.driver.reload_via_url():
                     time.sleep(1)
                 return self._save_noconnect()
@@ -336,15 +303,13 @@ class FrameCapture:
                 w, h = img.size
                 if w < 132:
                     self._safe_remove(self.temp_path)
-                    logging.warning(f"Узкий кадр (w={w}) для cam{self.cam_index} → перезагрузка")
                     if self.driver.reload_via_url():
                         time.sleep(1)
                     return self._save_noconnect()
-                img.crop((66, 0, w - 66, h)).save(self.temp_path, format='PNG', quality=95)
+                img.crop((66, 0, w-66, h)).save(self.temp_path, format='PNG', quality=95)
 
             if os.path.getsize(self.temp_path) / 1024 < 100:
                 self._safe_remove(self.temp_path)
-                logging.warning(f"Обманка (<100 КБ) для cam{self.cam_index} → перезагрузка")
                 if self.driver.reload_via_url():
                     time.sleep(1)
                 return self._save_noconnect()
@@ -353,12 +318,12 @@ class FrameCapture:
                 os.replace(self.temp_path, self.current_path)
             else:
                 os.rename(self.temp_path, self.current_path)
-            logging.info(f"Обновлён кадр cam{self.cam_index}: current.png")
+            logging.info(f"Кадр обновлён: cam{self.cam_index}")
             return True
 
         except Exception as e:
             self._safe_remove(self.temp_path)
-            logging.error(f"Исключение при захвате cam{self.cam_index}: {e}")
+            logging.error(f"Ошибка захвата cam{self.cam_index}: {e}")
             if self.driver.reload_via_url():
                 time.sleep(1)
             return self._save_noconnect()
@@ -367,11 +332,9 @@ class FrameCapture:
         src = resource_path(os.path.join("resource", "noconnect.png"))
         if os.path.exists(src):
             shutil.copy(src, self.current_path)
-            logging.info(f"Сохранена заглушка noconnect.png → cam{self.cam_index}")
+            logging.info(f"noconnect.png → cam{self.cam_index}")
             return True
-        else:
-            logging.warning(f"noconnect.png не найден для cam{self.cam_index}")
-            return False
+        return False
 
     def _safe_remove(self, path):
         try:
@@ -379,7 +342,6 @@ class FrameCapture:
                 os.remove(path)
         except:
             pass
-
 
 # ----------------------------------------------------------------------
 # Поток захвата
@@ -389,49 +351,46 @@ def capture_thread(cam_index, url):
     capture = FrameCapture(driver, cam_index)
     while True:
         capture.capture()
-        time.sleep(1)
-
+        time.sleep(CAPTURE_INTERVAL)
 
 # ----------------------------------------------------------------------
-# Импорт веб-сервера
+# Веб-сервер
 # ----------------------------------------------------------------------
 try:
     from web_server import start_web_server
 except ImportError:
-    logging.error("Не найден web_server.py — веб-интерфейс отключён")
+    logging.error("web_server.py не найден")
     start_web_server = lambda: None
-
 
 # ----------------------------------------------------------------------
 # Запуск
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     cleanup_processes()
-
-    # Проверка порта ДО запуска сервера
     exit_if_port_busy()
 
     config = ConfigManager()
-
-    # Запуск потоков захвата
-    capture_threads = []
+    threads = []
     for i in range(9):
         url = config.urls[i] if i < len(config.urls) else None
-        t = threading.Thread(target=capture_thread, args=(i + 1, url), daemon=True)
+        t = threading.Thread(target=capture_thread, args=(i+1, url), daemon=True)
         t.start()
-        capture_threads.append(t)
+        threads.append(t)
 
-    # Запуск веб-сервера
     web_thread = start_web_server()
 
-    # Ротация логов
     last_log_date = datetime.now().strftime("%Y%m%d")
+    NOCAM_PATH = resource_path(os.path.join("resource", "nocam.png"))
+    if not os.path.exists(NOCAM_PATH):
+        logging.warning("Заглушка nocam.png не найдена — завершение без замены кадров")
+
     try:
-        print("\nПриложение запущено.")
-        print("Захват кадров: 1 раз/сек")
-        print("Веб-сервер: http://localhost:5000")
-        print("VLC-потоки: http://localhost:5000/stream/cam1 ... /stream/cam9")
-        print("Для остановки нажмите Ctrl+C\n")
+        print(f"\nПриложение запущено.")
+        print(f"Интервал захвата: {CAPTURE_INTERVAL} сек")
+        print(f"Веб: http://localhost:5000")
+        print(f"VLC: http://localhost:5000/stream/cam1 ... /stream/cam9")
+        print(f"Для остановки: Ctrl+C\n")
+
         while True:
             now = datetime.now()
             today_str = now.strftime("%Y%m%d")
@@ -439,6 +398,42 @@ if __name__ == "__main__":
                 rotate_log_if_needed()
                 last_log_date = today_str
             time.sleep(60)
+
     except KeyboardInterrupt:
-        print("\nОстановка приложения...")
+        print("\n\nПолучен сигнал завершения (Ctrl+C)...")
+        logging.info("Инициация graceful shutdown...")
+
+        # === 1. Сначала копируем заглушку + обновляем mtime ===
+        if os.path.exists(NOCAM_PATH):
+            for cam_id in range(1, 10):
+                folder = os.path.join("capture", f"cam{cam_id}")
+                target = os.path.join(folder, "current.png")
+                try:
+                    if os.path.exists(folder):
+                        shutil.copy2(NOCAM_PATH, target)  # Сохраняет метаданные
+                        os.utime(target, None)  # <<< ГАРАНТИЯ изменения mtime
+                        logging.info(f"Заглушка → cam{cam_id}")
+                        print(f"  cam{cam_id} → заглушка")
+                except Exception as e:
+                    logging.error(f"Ошибка копирования в cam{cam_id}: {e}")
+
+        # === 2. Ждём, чтобы MJPEG отправил заглушку ===
+        print("  Ожидание 2 сек для доставки заглушки клиентам...")
+        time.sleep(2)
+
+        # === 3. Только потом шатдауним веб-сервер ===
+        try:
+            print("  Отправка команды завершения веб-серверу...")
+            requests.get("http://127.0.0.1:5000/shutdown", timeout=3)
+        except Exception as e:
+            logging.warning(f"Не удалось завершить веб-сервер: {e}")
+
+        # === 4. Финальная пауза ===
+        print("  Ожидание 3 сек для завершения потоков...")
+        time.sleep(3)
+
+        print("  Удаление Chrome/Driver...")
         cleanup_processes()
+
+        print("Приложение завершено.\n")
+        sys.exit(0)
