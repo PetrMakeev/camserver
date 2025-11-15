@@ -145,7 +145,7 @@ def mjpeg_stream(cam_id):
     return Response(
         generate_mjpeg(cam_id),
         mimetype='multipart/x-mixed-replace; boundary=frame',
-        headers={'Cache-Control': 'no-cache', 'Pragma': 'no-cache'}
+        headers={'Cache-Control': 'no-cache'}
     )
 
 @app.route('/api/set_urls', methods=['POST'])

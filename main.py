@@ -337,8 +337,9 @@ class FrameCapture:
     def _save_noconnect(self):
         src = resource_path(os.path.join("resource", "noconnect.png"))
         if os.path.exists(src):
-            shutil.copy(src, self.current_path)
-            logging.info(f"noconnect.png → cam{self.cam_index}")
+            shutil.copy2(src, self.current_path)
+            os.utime(self.current_path, None)
+            logging.info(f"noconnect.png -> cam{self.cam_index}")
             return True
         return False
 
@@ -359,19 +360,25 @@ def capture_thread(cam_index, initial_url):
 
     def restart_driver(new_url):
         nonlocal driver, capture
+
+        # === ПРОСТО ЗАКРЫВАЕМ СТАРЫЙ ДРАЙВЕР ===
         if driver:
             try: driver.quit()
             except: pass
             driver = None
         if capture:
             capture._safe_remove(capture.temp_path)
+
         time.sleep(1.5)
+
+        # === ЗАПУСКАЕМ НОВЫЙ ===
         if new_url:
             driver = BrowserDriver(new_url, cam_index)
             capture = FrameCapture(driver, cam_index)
         else:
             driver = None
             capture = None
+            # При отключении — nocam.png
             nocam_src = resource_path(os.path.join("resource", "nocam.png"))
             target = os.path.join("capture", f"cam{cam_index}", "current.png")
             if os.path.exists(nocam_src):
