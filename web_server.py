@@ -105,24 +105,24 @@ def load_and_convert_to_jpeg(image_path):
 def generate_mjpeg(cam_id):
     last_mtime = 0
     nocam_path = resource_path(os.path.join("resource", "nocam.png"))
-    noconnect_path = resource_path(os.path.join("resource", "noconnect.png"))
 
     while True:
         path = os.path.join(CAPTURE_ROOT, f"cam{cam_id}", "current.png")
-        placeholder = None
+        use_path = path
 
         if not os.path.exists(path):
-            placeholder = nocam_path if os.path.exists(nocam_path) else noconnect_path
-            if placeholder and os.path.exists(placeholder):
-                app.logger.info(f"Заглушка для cam{cam_id}: {os.path.basename(placeholder)}")
-        else:
-            current_mtime = os.path.getmtime(path)
-            if current_mtime <= last_mtime:
+            use_path = nocam_path
+            if not os.path.exists(use_path):
                 time.sleep(REFRESH_INTERVAL)
                 continue
-            last_mtime = current_mtime
 
-        jpeg_data = load_and_convert_to_jpeg(placeholder or path)
+        current_mtime = os.path.getmtime(use_path)
+        if current_mtime <= last_mtime:
+            time.sleep(REFRESH_INTERVAL)
+            continue
+        last_mtime = current_mtime
+
+        jpeg_data = load_and_convert_to_jpeg(use_path)
         if jpeg_data:
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n'
@@ -192,11 +192,14 @@ def shutdown():
             try:
                 if os.path.exists(os.path.dirname(target)):
                     shutil.copy2(nocam_path, target)
-                    os.utime(target, None)
+                    os.utime(target, None)  # ← ГАРАНТИЯ mtime
+                    app.logger.info(f"[SHUTDOWN] Заглушка -> cam{cam_id}")
             except Exception as e:
                 app.logger.error(f"[SHUTDOWN] Ошибка: {e}")
 
-    time.sleep(1)
+    # Даём генератору отправить кадр
+    time.sleep(2)
+
     func = flask.request.environ.get('werkzeug.server.shutdown')
     if func:
         func()

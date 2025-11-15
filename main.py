@@ -472,22 +472,27 @@ if __name__ == "__main__":
         print("\n\nПолучен сигнал завершения (Ctrl+C)...")
         logging.info("Инициация graceful shutdown...")
 
+        # === 1. КОПИРУЕМ ЗАГЛУШКУ СРАЗУ ===
         if os.path.exists(NOCAM_PATH):
             for cam_id in range(1, 10):
                 folder = os.path.join("capture", f"cam{cam_id}")
-                os.makedirs(folder, exist_ok=True)
                 target = os.path.join(folder, "current.png")
-                nocam_src = resource_path(os.path.join("resource", "nocam.png"))
-                if os.path.exists(nocam_src) and not os.path.exists(target):
-                    shutil.copy2(nocam_src, target)
-                    os.utime(target, None)
-                    logging.info(f"Инициализация: nocam.png → cam{cam_id}")
+                try:
+                    if os.path.exists(folder):
+                        shutil.copy2(NOCAM_PATH, target)
+                        os.utime(target, None)  # Обновляем mtime
+                        logging.info(f"Заглушка -> cam{cam_id}")
+                        print(f"  cam{cam_id} → заглушка")
+                except Exception as e:
+                    logging.error(f"Ошибка копирования в cam{cam_id}: {e}")
 
-        print("  Ожидание 2 сек для доставки заглушки...")
-        time.sleep(2)
+        # === 2. ЖДЁМ, ЧТОБЫ MJPEG ОТПРАВИЛ ЗАГЛУШКУ ===
+        print("  Ожидание 3 сек для доставки заглушки клиентам...")
+        time.sleep(3)
 
+        # === 3. ТОЛЬКО ПОТОМ ЗАВЕРШАЕМ СЕРВЕР ===
         try:
-            print("  Завершение веб-сервера...")
+            print("  Отправка команды завершения веб-серверу...")
             requests.get("http://127.0.0.1:5000/shutdown", timeout=3)
         except Exception as e:
             logging.warning(f"Не удалось завершить сервер: {e}")
