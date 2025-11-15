@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import threading
+from queue import Queue
 
 from ruamel.yaml import YAML
 
@@ -32,9 +33,15 @@ logging.getLogger("selenium").setLevel(logging.ERROR)
 SELENIUM_LOGGER.setLevel(logging.ERROR)
 
 # ----------------------------------------------------------------------
+# === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ API ===
+# ----------------------------------------------------------------------
+CAM_URLS = [None] * 9
+URL_UPDATE_QUEUE = Queue()
+
+# ----------------------------------------------------------------------
 # === КОНФИГУРАЦИЯ ===
 # ----------------------------------------------------------------------
-CAPTURE_INTERVAL = 1  # Интервал захвата кадров (секунды)
+CAPTURE_INTERVAL = 1
 
 # ----------------------------------------------------------------------
 # Логи (ротация по суткам)
@@ -274,11 +281,10 @@ class FrameCapture:
         self.temp_path = os.path.join(self.folder, self.TEMP_FILE)
 
     def capture(self):
-        if not self.driver.url:
+        if not self.driver or not self.driver.url:
             src = resource_path(os.path.join("resource", "nocam.png"))
             if os.path.exists(src):
                 shutil.copy(src, self.current_path)
-                logging.info(f"nocam.png → cam{self.cam_index}")
             return True
 
         try:
@@ -318,13 +324,13 @@ class FrameCapture:
                 os.replace(self.temp_path, self.current_path)
             else:
                 os.rename(self.temp_path, self.current_path)
-            logging.info(f"Кадр обновлён: cam{self.cam_index}")
+            # УБРАНО: logging.info(f"Кадр обновлён: cam{self.cam_index}")
             return True
 
         except Exception as e:
             self._safe_remove(self.temp_path)
             logging.error(f"Ошибка захвата cam{self.cam_index}: {e}")
-            if self.driver.reload_via_url():
+            if self.driver and self.driver.reload_via_url():
                 time.sleep(1)
             return self._save_noconnect()
 
@@ -346,11 +352,61 @@ class FrameCapture:
 # ----------------------------------------------------------------------
 # Поток захвата
 # ----------------------------------------------------------------------
-def capture_thread(cam_index, url):
-    driver = BrowserDriver(url, cam_index)
-    capture = FrameCapture(driver, cam_index)
+def capture_thread(cam_index, initial_url):
+    url = initial_url
+    driver = None
+    capture = None
+
+    def restart_driver(new_url):
+        nonlocal driver, capture
+        if driver:
+            try: driver.quit()
+            except: pass
+            driver = None
+        if capture:
+            capture._safe_remove(capture.temp_path)
+        time.sleep(1.5)
+        if new_url:
+            driver = BrowserDriver(new_url, cam_index)
+            capture = FrameCapture(driver, cam_index)
+        else:
+            driver = None
+            capture = None
+            nocam_src = resource_path(os.path.join("resource", "nocam.png"))
+            target = os.path.join("capture", f"cam{cam_index}", "current.png")
+            if os.path.exists(nocam_src):
+                shutil.copy2(nocam_src, target)
+                os.utime(target, None)
+
+    restart_driver(url)
+
     while True:
-        capture.capture()
+        updated = False
+        try:
+            while True:
+                event = URL_UPDATE_QUEUE.get_nowait()
+                if isinstance(event, tuple) and len(event) == 2:
+                    cam_id, new_url = event
+                    if cam_id == cam_index:
+                        logging.info(f"API: cam{cam_index} → {new_url or 'отключена'}")
+                        if new_url != url:
+                            url = new_url
+                            logging.info(f"Перезапуск cam{cam_index} → {url or 'отключена'}")
+                            restart_driver(url)
+                        updated = True
+                        break
+                    else:
+                        # Чужое событие — возвращаем в очередь
+                        URL_UPDATE_QUEUE.put(event)
+        except:
+            pass
+
+        if updated:
+            time.sleep(CAPTURE_INTERVAL)
+            continue
+
+        if capture:
+            capture.capture()
         time.sleep(CAPTURE_INTERVAL)
 
 # ----------------------------------------------------------------------
@@ -371,24 +427,37 @@ if __name__ == "__main__":
 
     config = ConfigManager()
     threads = []
+
     for i in range(9):
         url = config.urls[i] if i < len(config.urls) else None
+        CAM_URLS[i] = url
+
+    for i in range(9):
+        url = CAM_URLS[i]
         t = threading.Thread(target=capture_thread, args=(i+1, url), daemon=True)
         t.start()
         threads.append(t)
 
     web_thread = start_web_server()
 
+    try:
+        from web_server import set_update_queue
+        set_update_queue(URL_UPDATE_QUEUE)
+        logging.info("Очередь обновлений URL передана в web_server")
+    except Exception as e:
+        logging.error(f"Не удалось передать очередь: {e}")
+
     last_log_date = datetime.now().strftime("%Y%m%d")
     NOCAM_PATH = resource_path(os.path.join("resource", "nocam.png"))
     if not os.path.exists(NOCAM_PATH):
-        logging.warning("Заглушка nocam.png не найдена — завершение без замены кадров")
+        logging.warning("Заглушка nocam.png не найдена")
 
     try:
         print(f"\nПриложение запущено.")
         print(f"Интервал захвата: {CAPTURE_INTERVAL} сек")
         print(f"Веб: http://localhost:5000")
         print(f"VLC: http://localhost:5000/stream/cam1 ... /stream/cam9")
+        print(f"API: POST /api/set_urls → сменить URL")
         print(f"Для остановки: Ctrl+C\n")
 
         while True:
@@ -403,37 +472,27 @@ if __name__ == "__main__":
         print("\n\nПолучен сигнал завершения (Ctrl+C)...")
         logging.info("Инициация graceful shutdown...")
 
-        # === 1. Сначала копируем заглушку + обновляем mtime ===
         if os.path.exists(NOCAM_PATH):
             for cam_id in range(1, 10):
                 folder = os.path.join("capture", f"cam{cam_id}")
+                os.makedirs(folder, exist_ok=True)
                 target = os.path.join(folder, "current.png")
-                try:
-                    if os.path.exists(folder):
-                        shutil.copy2(NOCAM_PATH, target)  # Сохраняет метаданные
-                        os.utime(target, None)  # <<< ГАРАНТИЯ изменения mtime
-                        logging.info(f"Заглушка → cam{cam_id}")
-                        print(f"  cam{cam_id} → заглушка")
-                except Exception as e:
-                    logging.error(f"Ошибка копирования в cam{cam_id}: {e}")
+                nocam_src = resource_path(os.path.join("resource", "nocam.png"))
+                if os.path.exists(nocam_src) and not os.path.exists(target):
+                    shutil.copy2(nocam_src, target)
+                    os.utime(target, None)
+                    logging.info(f"Инициализация: nocam.png → cam{cam_id}")
 
-        # === 2. Ждём, чтобы MJPEG отправил заглушку ===
-        print("  Ожидание 2 сек для доставки заглушки клиентам...")
+        print("  Ожидание 2 сек для доставки заглушки...")
         time.sleep(2)
 
-        # === 3. Только потом шатдауним веб-сервер ===
         try:
-            print("  Отправка команды завершения веб-серверу...")
+            print("  Завершение веб-сервера...")
             requests.get("http://127.0.0.1:5000/shutdown", timeout=3)
         except Exception as e:
-            logging.warning(f"Не удалось завершить веб-сервер: {e}")
+            logging.warning(f"Не удалось завершить сервер: {e}")
 
-        # === 4. Финальная пауза ===
-        print("  Ожидание 3 сек для завершения потоков...")
         time.sleep(3)
-
-        print("  Удаление Chrome/Driver...")
         cleanup_processes()
-
         print("Приложение завершено.\n")
         sys.exit(0)
