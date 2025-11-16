@@ -1,4 +1,3 @@
-# web_server.py
 import os
 import threading
 import time

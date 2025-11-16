@@ -32,10 +32,13 @@ logging.getLogger("selenium").setLevel(logging.ERROR)
 SELENIUM_LOGGER.setLevel(logging.ERROR)
 
 # ----------------------------------------------------------------------
-# === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ API ===
+# === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
 # ----------------------------------------------------------------------
 CAM_URLS = [None] * 9
 URL_UPDATE_QUEUE = Queue()
+
+# Защита от повторной инициализации логгера
+LOGGING_INITIALIZED = False
 
 # ----------------------------------------------------------------------
 # === КОНФИГУРАЦИЯ ===
@@ -68,16 +71,16 @@ def create_new_handler():
     return handler
 
 def setup_logging():
+    global LOGGING_INITIALIZED
+    if LOGGING_INITIALIZED:
+        return
     root = logging.getLogger()
     for h in list(root.handlers):
         h.close()
         root.removeHandler(h)
     root.addHandler(create_new_handler())
     root.setLevel(logging.INFO)
-
-# === ОДИН РАЗ ПРИ СТАРТЕ ===
-setup_logging()
-logging.info("=== КОНСОЛЬНОЕ ПРИЛОЖЕНИЕ ЗАПУЩЕНО ===")
+    LOGGING_INITIALIZED = True
 
 def rotate_log_if_needed():
     current_log = get_current_log_path()
@@ -273,13 +276,9 @@ class FrameCapture:
         self.folder.mkdir(parents=True, exist_ok=True)
         self.current_path = self.folder / self.CURRENT_FILE
         self.temp_path = self.folder / self.TEMP_FILE
-        self.nocam_logged = False  # ← ОДИН РАЗ ПРИ СТАРТЕ
 
     def capture(self):
         if not self.driver or self.driver.url == "about:blank":
-            if not self.nocam_logged:
-                logging.info(f"nocam.png -> cam{self.cam_index} (старт)")
-                self.nocam_logged = True
             return self._save_noconnect()
 
         try:
@@ -333,7 +332,6 @@ class FrameCapture:
             try:
                 self.current_path.write_bytes(NOCAM_IMAGE_BYTES)
                 os.utime(self.current_path, None)
-                # НЕ ЛОГИРУЕМ КАЖДЫЙ ТИК
                 return True
             except Exception as e:
                 logging.error(f"Ошибка записи nocam.png для cam{self.cam_index}: {e}")
@@ -372,8 +370,6 @@ def capture_thread(cam_index, initial_url):
         else:
             driver = BrowserDriver("about:blank", cam_index)
             capture = FrameCapture(driver, cam_index)
-            # Логируем только при старте
-            capture._save_noconnect()
 
     restart_driver(url)
 
@@ -411,7 +407,7 @@ def capture_thread(cam_index, initial_url):
 try:
     from web_server import start_web_server, set_update_queue
     WEB_SERVER_AVAILABLE = True
-except Exception:  # ← НЕ ЛОГИРУЕМ ОШИБКУ
+except Exception:
     start_web_server = lambda: None
     set_update_queue = lambda q: None
     WEB_SERVER_AVAILABLE = False
@@ -420,6 +416,9 @@ except Exception:  # ← НЕ ЛОГИРУЕМ ОШИБКУ
 # Запуск
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
+    setup_logging()  # ← Только здесь
+    logging.info("=== КОНСОЛЬНОЕ ПРИЛОЖЕНИЕ ЗАПУЩЕНО ===")
+
     cleanup_processes()
     exit_if_port_busy()
 
@@ -465,7 +464,6 @@ if __name__ == "__main__":
         print("\n\nПолучен сигнал завершения (Ctrl+C)...")
         logging.info("Инициация graceful shutdown...")
 
-        # === 1. КОПИРУЕМ ЗАГЛУШКУ ВО ВСЕ current.png ===
         if NOCAM_IMAGE_BYTES:
             for cam_id in range(1, 10):
                 folder = Path("capture") / f"cam{cam_id}"
@@ -473,17 +471,15 @@ if __name__ == "__main__":
                 try:
                     folder.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(NOCAM_IMAGE_BYTES)
-                    os.utime(target, None)  # ← mtime меняется → MJPEG увидит
+                    os.utime(target, None)
                     logging.info(f"Заглушка -> cam{cam_id} (выход)")
                     print(f"  cam{cam_id} → заглушка")
                 except Exception as e:
                     logging.error(f"Ошибка записи в cam{cam_id}: {e}")
 
-        # === 2. ДАЁМ ВРЕМЯ MJPEG ОТПРАВИТЬ КАДР ===
         print("  Ожидание 4 сек для доставки заглушки клиентам...")
-        time.sleep(4)  # ← УВЕЛИЧЕНО до 4 сек
+        time.sleep(4)
 
-        # === 3. ЗАВЕРШАЕМ СЕРВЕР ===
         try:
             print("  Отправка команды завершения веб-серверу...")
             requests.get("http://127.0.0.1:5000/shutdown", timeout=5)
