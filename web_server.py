@@ -2,7 +2,6 @@
 import os
 import threading
 import time
-import shutil
 import flask
 import logging
 from flask import Flask, Response, render_template_string, request, jsonify
@@ -11,9 +10,6 @@ from PIL import Image
 import io
 from queue import Queue
 
-# ----------------------------------------------------------------------
-# Импорт resource_path и NOCAM_IMAGE_BYTES
-# ----------------------------------------------------------------------
 try:
     from main import resource_path, NOCAM_IMAGE_BYTES
 except ImportError:
@@ -21,9 +17,6 @@ except ImportError:
         return Path.cwd() / relative_path
     NOCAM_IMAGE_BYTES = None
 
-# ----------------------------------------------------------------------
-# Конфигурация
-# ----------------------------------------------------------------------
 CAPTURE_ROOT = Path("capture")
 REFRESH_INTERVAL = 0.5
 JPEG_QUALITY = 80
@@ -31,7 +24,6 @@ HOST = "0.0.0.0"
 PORT = 5000
 DEBUG = False
 
-# Глобальные переменные
 CAM_URLS = [None] * 9
 LAST_UPDATE_TIME = 0
 URL_UPDATE_QUEUE = None
@@ -39,22 +31,15 @@ URL_UPDATE_QUEUE = None
 def set_update_queue(queue: Queue):
     global URL_UPDATE_QUEUE
     URL_UPDATE_QUEUE = queue
-    print("[WEB] Очередь обновлений URL получена")
 
-# ----------------------------------------------------------------------
-# Flask + логирование
-# ----------------------------------------------------------------------
 app = Flask(__name__)
 
 if not DEBUG:
-    handler = logging.FileHandler('capture.log')
+    handler = logging.FileHandler('capture.log', encoding='utf-8')  # ← ДОБАВЛЕНО encoding='utf-8'
     handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     app.logger.addHandler(handler)
     app.logger.setLevel(logging.INFO)
 
-# ----------------------------------------------------------------------
-# HTML
-# ----------------------------------------------------------------------
 INDEX_HTML = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -85,9 +70,6 @@ INDEX_HTML = """
 </html>
 """
 
-# ----------------------------------------------------------------------
-# MJPEG
-# ----------------------------------------------------------------------
 def load_and_convert_to_jpeg(image_bytes):
     try:
         if not image_bytes:
@@ -105,39 +87,38 @@ def generate_mjpeg(cam_id):
     current_path = CAPTURE_ROOT / f"cam{cam_id}" / "current.png"
 
     while True:
-        if not current_path.exists():
-            if NOCAM_IMAGE_BYTES:
-                jpeg_data = load_and_convert_to_jpeg(NOCAM_IMAGE_BYTES)
-                if jpeg_data:
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n'
-                           b'Content-Length: ' + str(len(jpeg_data)).encode() + b'\r\n\r\n' +
-                           jpeg_data + b'\r\n')
-            time.sleep(REFRESH_INTERVAL)
-            continue
+        # === ПРИНУДИТЕЛЬНО ПРОВЕРЯЕМ ФАЙЛ КАЖДЫЙ ЦИКЛ ===
+        if current_path.exists():
+            current_mtime = current_path.stat().st_mtime
+            # === ЕСЛИ ФАЙЛ СУЩЕСТВУЕТ — ЧИТАЕМ ===
+            try:
+                image_bytes = current_path.read_bytes()
+            except:
+                image_bytes = NOCAM_IMAGE_BYTES
+        else:
+            image_bytes = NOCAM_IMAGE_BYTES
+            current_mtime = time.time()  # ← ФИКТИВНЫЙ mtime
 
-        current_mtime = current_path.stat().st_mtime
-        if current_mtime <= last_mtime:
-            time.sleep(REFRESH_INTERVAL)
-            continue
-        last_mtime = current_mtime
-
-        try:
-            jpeg_data = load_and_convert_to_jpeg(current_path.read_bytes())
-        except:
-            jpeg_data = load_and_convert_to_jpeg(NOCAM_IMAGE_BYTES)
-
-        if jpeg_data:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n'
-                   b'Content-Length: ' + str(len(jpeg_data)).encode() + b'\r\n\r\n' +
-                   jpeg_data + b'\r\n')
+        # === ОТПРАВЛЯЕМ, ЕСЛИ ЕСТЬ ДАННЫЕ ===
+        if image_bytes:
+            jpeg_data = load_and_convert_to_jpeg(image_bytes)
+            if jpeg_data:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n'
+                       b'Content-Length: ' + str(len(jpeg_data)).encode() + b'\r\n\r\n' +
+                       jpeg_data + b'\r\n')
+                # === СБРАСЫВАЕМ mtime ПОСЛЕ ОТПРАВКИ ===
+                last_mtime = 0
+            else:
+                time.sleep(REFRESH_INTERVAL)
+                continue
         else:
             time.sleep(REFRESH_INTERVAL)
+            continue
 
-# ----------------------------------------------------------------------
-# Маршруты
-# ----------------------------------------------------------------------
+        # === ЖДЁМ НОВОГО КАДРА ===
+        time.sleep(REFRESH_INTERVAL)
+
 @app.route('/')
 def index():
     return render_template_string(INDEX_HTML)
@@ -149,7 +130,12 @@ def mjpeg_stream(cam_id):
     return Response(
         generate_mjpeg(cam_id),
         mimetype='multipart/x-mixed-replace; boundary=frame',
-        headers={'Cache-Control': 'no-cache'}
+        headers={
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+            'Connection': 'close'
+        }
     )
 
 @app.route('/api/set_urls', methods=['POST'])
@@ -172,12 +158,11 @@ def set_urls():
         CAM_URLS[:] = new_urls
         LAST_UPDATE_TIME = now
 
-        logging.info(f"API запрос: set_urls → {new_urls}")
+        app.logger.info(f"API запрос: set_urls → {new_urls}")
 
         if URL_UPDATE_QUEUE is not None:
             for i, url in enumerate(new_urls):
                 URL_UPDATE_QUEUE.put((i + 1, url))
-            print(f"[API] Отправлено 9 отдельных обновлений URL")
 
         return jsonify({
             "status": "ok",
@@ -198,32 +183,30 @@ def status():
 
 @app.route('/shutdown')
 def shutdown():
+    print("[SHUTDOWN] Копирование заглушки...")
     if NOCAM_IMAGE_BYTES:
         for cam_id in range(1, 10):
             target = CAPTURE_ROOT / f"cam{cam_id}" / "current.png"
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(NOCAM_IMAGE_BYTES)
-                os.utime(target, None)
+                # === ПРИНУДИТЕЛЬНО МЕНЯЕМ mtime ===
+                os.utime(target, (time.time(), time.time()))
                 app.logger.info(f"[SHUTDOWN] Заглушка -> cam{cam_id}")
             except Exception as e:
                 app.logger.error(f"[SHUTDOWN] Ошибка: {e}")
 
-    time.sleep(2)
+    print("[SHUTDOWN] Ожидание 6 сек для отправки заглушки...")
+    time.sleep(6)  # ← 6 СЕКУНД — ГАРАНТИЯ
 
-    func = flask.request.environ.get('werkzeug.server.shutdown')
+    # === ОТПРАВЛЯЕМ FIN КЛИЕНТАМ ===
+    print("[SHUTDOWN] Завершение сервера...")
+    func = request.environ.get('werkzeug.server.shutdown')
     if func:
         func()
     return "Сервер завершается...", 200
 
-# ----------------------------------------------------------------------
-# Запуск
-# ----------------------------------------------------------------------
 def run_server():
-    print(f"[WEB] VLC-потоки: http://localhost:{PORT}/stream/cam1 ... /stream/cam9")
-    print(f"[WEB] API: POST http://localhost:{PORT}/api/set_urls")
-    print(f"[WEB] API: GET http://localhost:{PORT}/api/status")
-    print(f"[WEB] Завершение: http://localhost:{PORT}/shutdown")
     app.run(host=HOST, port=PORT, debug=DEBUG, threaded=True, use_reloader=False)
 
 def start_web_server():
@@ -237,4 +220,4 @@ if __name__ == "__main__":
     try:
         while True: time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[WEB] Остановлено.")
+        pass

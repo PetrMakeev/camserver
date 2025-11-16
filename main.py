@@ -13,8 +13,6 @@ from pathlib import Path
 import threading
 from queue import Queue
 
-from ruamel.yaml import YAML  # Оставлен, но не используется
-
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -69,7 +67,7 @@ def create_new_handler():
     handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     return handler
 
-def replace_log_handler():
+def setup_logging():
     root = logging.getLogger()
     for h in list(root.handlers):
         h.close()
@@ -77,7 +75,8 @@ def replace_log_handler():
     root.addHandler(create_new_handler())
     root.setLevel(logging.INFO)
 
-replace_log_handler()
+# === ОДИН РАЗ ПРИ СТАРТЕ ===
+setup_logging()
 logging.info("=== КОНСОЛЬНОЕ ПРИЛОЖЕНИЕ ЗАПУЩЕНО ===")
 
 def rotate_log_if_needed():
@@ -98,10 +97,10 @@ def rotate_log_if_needed():
             root.removeHandler(h)
         current_log.rename(dated_log)
         logging.info(f"Лог переименован: {current_log} → {dated_log}")
-        replace_log_handler()
+        setup_logging()
     except Exception as e:
         try:
-            replace_log_handler()
+            setup_logging()
         except:
             pass
         logging.warning(f"Не удалось ротировать лог: {e}")
@@ -274,9 +273,13 @@ class FrameCapture:
         self.folder.mkdir(parents=True, exist_ok=True)
         self.current_path = self.folder / self.CURRENT_FILE
         self.temp_path = self.folder / self.TEMP_FILE
+        self.nocam_logged = False  # ← ОДИН РАЗ ПРИ СТАРТЕ
 
     def capture(self):
         if not self.driver or self.driver.url == "about:blank":
+            if not self.nocam_logged:
+                logging.info(f"nocam.png -> cam{self.cam_index} (старт)")
+                self.nocam_logged = True
             return self._save_noconnect()
 
         try:
@@ -330,7 +333,7 @@ class FrameCapture:
             try:
                 self.current_path.write_bytes(NOCAM_IMAGE_BYTES)
                 os.utime(self.current_path, None)
-                logging.info(f"nocam.png -> cam{self.cam_index}")
+                # НЕ ЛОГИРУЕМ КАЖДЫЙ ТИК
                 return True
             except Exception as e:
                 logging.error(f"Ошибка записи nocam.png для cam{self.cam_index}: {e}")
@@ -369,6 +372,7 @@ def capture_thread(cam_index, initial_url):
         else:
             driver = BrowserDriver("about:blank", cam_index)
             capture = FrameCapture(driver, cam_index)
+            # Логируем только при старте
             capture._save_noconnect()
 
     restart_driver(url)
@@ -402,13 +406,15 @@ def capture_thread(cam_index, initial_url):
         time.sleep(CAPTURE_INTERVAL)
 
 # ----------------------------------------------------------------------
-# Веб-сервер
+# Веб-сервер (без логов об импорте)
 # ----------------------------------------------------------------------
 try:
-    from web_server import start_web_server
-except ImportError:
-    logging.error("web_server.py не найден")
+    from web_server import start_web_server, set_update_queue
+    WEB_SERVER_AVAILABLE = True
+except Exception:  # ← НЕ ЛОГИРУЕМ ОШИБКУ
     start_web_server = lambda: None
+    set_update_queue = lambda q: None
+    WEB_SERVER_AVAILABLE = False
 
 # ----------------------------------------------------------------------
 # Запуск
@@ -419,10 +425,6 @@ if __name__ == "__main__":
 
     load_nocam_image()
 
-    # Инициализация всех камер как None → about:blank
-    for i in range(9):
-        CAM_URLS[i] = None
-
     threads = []
     for i in range(9):
         t = threading.Thread(target=capture_thread, args=(i+1, None), daemon=True)
@@ -431,12 +433,14 @@ if __name__ == "__main__":
 
     web_thread = start_web_server()
 
-    try:
-        from web_server import set_update_queue
-        set_update_queue(URL_UPDATE_QUEUE)
-        logging.info("Очередь обновлений URL передана в web_server")
-    except Exception as e:
-        logging.error(f"Не удалось передать очередь: {e}")
+    if WEB_SERVER_AVAILABLE:
+        try:
+            set_update_queue(URL_UPDATE_QUEUE)
+            logging.info("Очередь обновлений URL передана в web_server")
+        except Exception as e:
+            logging.error(f"Не удалось передать очередь: {e}")
+    else:
+        logging.warning("web_server.py недоступен — API и потоки отключены")
 
     last_log_date = datetime.now().strftime("%Y%m%d")
 
@@ -461,7 +465,7 @@ if __name__ == "__main__":
         print("\n\nПолучен сигнал завершения (Ctrl+C)...")
         logging.info("Инициация graceful shutdown...")
 
-        # === 1. КОПИРУЕМ ЗАГЛУШКУ СРАЗУ ===
+        # === 1. КОПИРУЕМ ЗАГЛУШКУ ВО ВСЕ current.png ===
         if NOCAM_IMAGE_BYTES:
             for cam_id in range(1, 10):
                 folder = Path("capture") / f"cam{cam_id}"
@@ -469,24 +473,24 @@ if __name__ == "__main__":
                 try:
                     folder.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(NOCAM_IMAGE_BYTES)
-                    os.utime(target, None)
-                    logging.info(f"Заглушка -> cam{cam_id}")
+                    os.utime(target, None)  # ← mtime меняется → MJPEG увидит
+                    logging.info(f"Заглушка -> cam{cam_id} (выход)")
                     print(f"  cam{cam_id} → заглушка")
                 except Exception as e:
                     logging.error(f"Ошибка записи в cam{cam_id}: {e}")
 
-        # === 2. ЖДЁМ, ЧТОБЫ MJPEG ОТПРАВИЛ ЗАГЛУШКУ ===
-        print("  Ожидание 3 сек для доставки заглушки клиентам...")
-        time.sleep(3)
+        # === 2. ДАЁМ ВРЕМЯ MJPEG ОТПРАВИТЬ КАДР ===
+        print("  Ожидание 4 сек для доставки заглушки клиентам...")
+        time.sleep(4)  # ← УВЕЛИЧЕНО до 4 сек
 
         # === 3. ЗАВЕРШАЕМ СЕРВЕР ===
         try:
             print("  Отправка команды завершения веб-серверу...")
-            requests.get("http://127.0.0.1:5000/shutdown", timeout=3)
+            requests.get("http://127.0.0.1:5000/shutdown", timeout=5)
         except Exception as e:
             logging.warning(f"Не удалось завершить сервер: {e}")
 
-        time.sleep(3)
+        time.sleep(2)
         cleanup_processes()
         print("Приложение завершено.\n")
         sys.exit(0)
