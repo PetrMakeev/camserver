@@ -12,18 +12,19 @@ import io
 from queue import Queue
 
 # ----------------------------------------------------------------------
-# Импорт resource_path
+# Импорт resource_path и NOCAM_IMAGE_BYTES
 # ----------------------------------------------------------------------
 try:
-    from main import resource_path
+    from main import resource_path, NOCAM_IMAGE_BYTES
 except ImportError:
     def resource_path(relative_path):
-        return os.path.join(os.path.abspath("."), relative_path)
+        return Path.cwd() / relative_path
+    NOCAM_IMAGE_BYTES = None
 
 # ----------------------------------------------------------------------
 # Конфигурация
 # ----------------------------------------------------------------------
-CAPTURE_ROOT = "capture"
+CAPTURE_ROOT = Path("capture")
 REFRESH_INTERVAL = 0.5
 JPEG_QUALITY = 80
 HOST = "0.0.0.0"
@@ -45,7 +46,6 @@ def set_update_queue(queue: Queue):
 # ----------------------------------------------------------------------
 app = Flask(__name__)
 
-# Логирование в файл
 if not DEBUG:
     handler = logging.FileHandler('capture.log')
     handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
@@ -88,41 +88,45 @@ INDEX_HTML = """
 # ----------------------------------------------------------------------
 # MJPEG
 # ----------------------------------------------------------------------
-def load_and_convert_to_jpeg(image_path):
+def load_and_convert_to_jpeg(image_bytes):
     try:
-        if not os.path.exists(image_path):
-            app.logger.warning(f"Файл не найден: {image_path}")
+        if not image_bytes:
             return None
-        with Image.open(image_path) as img:
-            img = img.convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-            return buf.getvalue()
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        return buf.getvalue()
     except Exception as e:
-        app.logger.error(f"[JPEG] Ошибка: {e} | Файл: {image_path}")
+        app.logger.error(f"[JPEG] Ошибка: {e}")
         return None
 
 def generate_mjpeg(cam_id):
     last_mtime = 0
-    nocam_path = resource_path(os.path.join("resource", "nocam.png"))
+    current_path = CAPTURE_ROOT / f"cam{cam_id}" / "current.png"
 
     while True:
-        path = os.path.join(CAPTURE_ROOT, f"cam{cam_id}", "current.png")
-        use_path = path
+        if not current_path.exists():
+            if NOCAM_IMAGE_BYTES:
+                jpeg_data = load_and_convert_to_jpeg(NOCAM_IMAGE_BYTES)
+                if jpeg_data:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n'
+                           b'Content-Length: ' + str(len(jpeg_data)).encode() + b'\r\n\r\n' +
+                           jpeg_data + b'\r\n')
+            time.sleep(REFRESH_INTERVAL)
+            continue
 
-        if not os.path.exists(path):
-            use_path = nocam_path
-            if not os.path.exists(use_path):
-                time.sleep(REFRESH_INTERVAL)
-                continue
-
-        current_mtime = os.path.getmtime(use_path)
+        current_mtime = current_path.stat().st_mtime
         if current_mtime <= last_mtime:
             time.sleep(REFRESH_INTERVAL)
             continue
         last_mtime = current_mtime
 
-        jpeg_data = load_and_convert_to_jpeg(use_path)
+        try:
+            jpeg_data = load_and_convert_to_jpeg(current_path.read_bytes())
+        except:
+            jpeg_data = load_and_convert_to_jpeg(NOCAM_IMAGE_BYTES)
+
         if jpeg_data:
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n'
@@ -183,21 +187,28 @@ def set_urls():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/status')
+def status():
+    return jsonify({
+        "cams": [
+            {"id": i+1, "url": CAM_URLS[i] or None}
+            for i in range(9)
+        ]
+    })
+
 @app.route('/shutdown')
 def shutdown():
-    nocam_path = resource_path(os.path.join("resource", "nocam.png"))
-    if os.path.exists(nocam_path):
+    if NOCAM_IMAGE_BYTES:
         for cam_id in range(1, 10):
-            target = os.path.join(CAPTURE_ROOT, f"cam{cam_id}", "current.png")
+            target = CAPTURE_ROOT / f"cam{cam_id}" / "current.png"
             try:
-                if os.path.exists(os.path.dirname(target)):
-                    shutil.copy2(nocam_path, target)
-                    os.utime(target, None)  # ← ГАРАНТИЯ mtime
-                    app.logger.info(f"[SHUTDOWN] Заглушка -> cam{cam_id}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(NOCAM_IMAGE_BYTES)
+                os.utime(target, None)
+                app.logger.info(f"[SHUTDOWN] Заглушка -> cam{cam_id}")
             except Exception as e:
                 app.logger.error(f"[SHUTDOWN] Ошибка: {e}")
 
-    # Даём генератору отправить кадр
     time.sleep(2)
 
     func = flask.request.environ.get('werkzeug.server.shutdown')
@@ -211,6 +222,7 @@ def shutdown():
 def run_server():
     print(f"[WEB] VLC-потоки: http://localhost:{PORT}/stream/cam1 ... /stream/cam9")
     print(f"[WEB] API: POST http://localhost:{PORT}/api/set_urls")
+    print(f"[WEB] API: GET http://localhost:{PORT}/api/status")
     print(f"[WEB] Завершение: http://localhost:{PORT}/shutdown")
     app.run(host=HOST, port=PORT, debug=DEBUG, threaded=True, use_reloader=False)
 
